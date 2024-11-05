@@ -4,10 +4,16 @@ import json
 import requests
 import csv
 import time
-from typing import Union, Callable, List, Optional, Dict
-from os.path import join
+from typing import Union, Callable, List, Optional, Dict, Any
+from os.path import join, basename, isdir, isfile, splitext
+from os import listdir
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import logging
+import boto3
+import awswrangler as wr
+import re
 
 try:
     import cx_Oracle
@@ -22,6 +28,7 @@ from comodash_api_client_lowlevel import QueriesApi, LoadsApi, MigrationsApi
 from comodash_api_client_lowlevel.models.query_text import QueryText
 from urllib3.exceptions import IncompleteRead
 from urllib3.response import HTTPResponse
+from comodash_api_client_lowlevel import Load
 from comodash_api_client_lowlevel.models.query import Query as QueryInfo
 from comodash_api_client_lowlevel.models.load import Load as LoadInfo
 from comodash_api_client_lowlevel.models.file_upload_request import FileUploadRequest
@@ -30,8 +37,10 @@ from comodash_api_client_lowlevel.models.load_commit import LoadCommit
 from comodash_api_client_lowlevel.models.load import Load
 from comodash_api_client_lowlevel.models.query_id import QueryId
 from comodash_api_client_lowlevel.rest import ApiException
-
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import random 
+import string
+from inspect import signature, Parameter
 
 class DashConfig(comodash_api_client_lowlevel.Configuration):
     """
@@ -106,9 +115,31 @@ class Load():
     Initialising this class starts a Load on Comotion Dash and stores the
     resulting load_id in `load_id`
 
-    If you wish to work with an existing load, then simply supply load_id parameter
+    If you wish to work with an existing load, then supply only the load_id parameter
 
-    @TODO Outline of how to use this class to upload a file here.
+    Example of upload with a Load instance:
+    
+    .. code-block:: python
+
+        load = Load(config = DashConfig(Auth('orgname')), 
+                    table_name = 'v1_inforce_policies', 
+                    load_as_service_client_id = '0') # Create the load
+        
+        for file, file_key in zip(file_path_list, file_keys): # Upload files with Load object
+            load.upload(
+                data = file,
+                file_key = file_key
+            )
+
+        load.commit( # Commit the load - this validates the files and pushes to the table_name specified
+            check_sum = { # Check that data uploaded matches what you expected before pushing to the lake.  *Also see track_rows_uploaded option
+                'sum(face_amount)': 20000,
+                'count(distinct policy_number)': 1000
+            }
+        )
+
+        print(load.get_load_info()) # Run this at any time to get the latest information on the load
+
     """
 
     def __init__(
@@ -118,7 +149,9 @@ class Load():
             table_name: str = None,
             load_as_service_client_id: str = None,
             partitions: Optional[List[str]] = None,
-            load_id: str = None
+            load_id: str = None,
+            track_rows_uploaded: bool = None,
+            path_to_output_for_dryrun: str = None
     ):
         """
         Parameters
@@ -136,8 +169,16 @@ class Load():
             Only applies if table does not already exist and is created. The created table will have these partitions. This must be a list of iceberg compatible partitions. Note that any load can only allow for up to 100 partitions, otherwise it will error out. If the table already exists, then this is ignored.
         load_id : str, optional
             In the case where you want to work with an existing load on dash, supply this parameter, and no other parameter (other than config) will be required.
+        track_rows_uploaded: bool, optional
+            If True, track the number of rows uploaded with the current Load instance.  This can be used to automatically create a checksum on commit (see Load.commit), however is not recommended for 
+            large files as this may increase the duration of upload significantly.
+        path_to_output_for_dryrun: str, optional
+            if specified, no upload will be made to dash, but files
+            will be saved to the location specified. This is useful for testing.
         """
         load_data = locals()
+        lowerlevel_load_sig = signature(comodash_api_client_lowlevel.Load)
+        lowerlevel_load_keys = [key for key in lowerlevel_load_sig.parameters.keys()]
         if not(isinstance(config, DashConfig)):
             raise TypeError("config must be of type comotion.dash.DashConfig")
         
@@ -154,14 +195,25 @@ class Load():
                             raise TypeError("if load_id is supplied, then only the config parameter and no others should be supplied.")
             else:
                 # Enter a context with an instance of the API client
-                del load_data['config']
-                del load_data['self']
-                del load_data['load_id']
-                load = comodash_api_client_lowlevel.Load(**load_data)
+                lowerlevel_load_kwargs = {
+                        key: value
+                        for key, value in load_data.items()
+                        if key in lowerlevel_load_keys
+                }
+
+                load = comodash_api_client_lowlevel.Load(**lowerlevel_load_kwargs)
 
                 # Create a new load
                 load_id_model = self.load_api_instance.create_load(load)
                 self.load_id = load_id_model.load_id
+
+            if track_rows_uploaded:
+                self.track_rows_uploaded = track_rows_uploaded
+            else:
+                self.track_rows_uploaded = False
+
+            self.rows_uploaded = 0
+            self.path_to_output_for_dryrun = path_to_output_for_dryrun
 
     def get_load_info(self) -> LoadInfo:
         """Gets the state of the load
@@ -215,7 +267,97 @@ class Load():
 
         return self.load_api_instance.generate_presigned_url_for_file_upload(self.load_id, file_upload_request=file_upload_request)
         
-    def commit(self, check_sum: Dict[str, Union[int, float, str]]):
+    def upload(self, 
+                data: Union[str, io.FileIO, pd.DataFrame], 
+                file_key: str = None,
+                file_upload_response: FileUploadResponse = None):
+        """
+        Uploads a file to an S3 bucket using a presigned URL.
+
+        Parameters:
+        ----------
+        file : Union[str, io.FileIO]
+            The file to be uploaded. This can be a file path (str) or a file object (io.FileIO).
+        file_key : str, optional
+            Optional custom key for the file. This will ensure idempotence.
+            If multiple files are uploaded to the same load with the same file_key,
+            only the last one will be pushed to the lake. Must be lowercase and can include underscores.
+        file_upload_response : FileUploadResponse, optional
+            An instance of FileUploadResponse containing the presigned URL and AWS credentials. If not provided, it will be generated.
+
+        Raises:
+        ------
+        ValueError
+            If `file_upload_response` is not a valid instance of FileUploadResponse.
+
+        Returns:
+        -------
+        None
+
+        Example:
+        -------
+        .. code-block:: python
+
+        load = Load(dashconfig)
+        load.upload(data = 'path/to/file.parquet', file_key='my_file_id')
+        """
+        if isinstance(data, pd.DataFrame):
+            df = data
+            table = pa.Table.from_pandas(df)
+
+            parquet_buffer = io.BytesIO()
+            pq.write_table(table, parquet_buffer)
+            parquet_buffer.seek(0)
+            file = parquet_buffer
+
+        if not file_upload_response:
+            file_upload_response = self.generate_presigned_url_for_file_upload(file_key=file_key)
+
+        if not isinstance(file_upload_response, FileUploadResponse):
+            raise ValueError("file_upload_response should be a valid instance of FileUploadResponse.")
+        else:
+            s3_file_name = basename(file_upload_response.path)
+            
+            # Create a session with AWS credentials from the presigned URL
+            my_session = boto3.Session(
+                aws_access_key_id=file_upload_response.sts_credentials['AccessKeyId'],
+                aws_secret_access_key=file_upload_response.sts_credentials['SecretAccessKey'],
+                aws_session_token=file_upload_response.sts_credentials['SessionToken']
+            )
+            bucket = file_upload_response.bucket
+            key = file_upload_response.path 
+
+            # Upload the Parquet buffer as a chunk to S3
+            print(f"Uploading to S3: {s3_file_name}")
+            
+            if not self.path_to_output_for_dryrun:
+                upload_reponse = wr.s3.upload(
+                    local_file=file, 
+                    path=f"s3://{bucket}/{key}", 
+                    boto3_session=my_session,
+                    use_threads=True
+                )
+            else:
+                local_path = join(self.path_to_output_for_dryrun, f"{basename(key)}.parquet")
+                df = pd.read_parquet(file)
+                table = pa.Table.from_pandas(df)
+                pq.write_table(table, local_path)
+                print(f"File written locally to: {local_path}")
+                upload_reponse = 'DRYRUN_COMPLETE' # Arbitrary reponse as file write has no return
+
+            if self.track_rows_uploaded:
+                # Count the rows in the Parquet file
+                df = pd.read_parquet(file)
+                rows_uploaded = df.shape[0]
+                self.rows_uploaded += rows_uploaded
+                print(f"Successfully uploaded {key}: {rows_uploaded} rows")
+                print(f"Total rows uploaded for load {self.load_id}: {self.rows_uploaded}")
+            else:
+                print(f"Upload completed: {key}")
+
+            return upload_reponse
+            
+    def commit(self, check_sum: Optional[Dict[str, Union[int, float, str]]] = None):
         """
         Kicks off the commit of the load. A checksum must be provided
         which is checked on the server side to ensure that the data provided
@@ -224,11 +366,14 @@ class Load():
 
         Parameters
         ----------
-        check_sum : Dict[str, Union[int, float, str]]
+        check_sum : Dict[str, Union[int, float, str]] (optional)
             Checksum data for the files to be committed.
             Checksums must be in the form of a dictionary, with presto / trino expressions
             as the key, and the expected result as the value. 
-            At least one is required
+
+            A check sum is not required if track_rows_uploaded was set to true for the load.  
+            This essentially builds the checksum {'count(*)': nrows_uploads} and adds it as an extrac checksum.
+
             Example:
 
             .. code-block:: python
@@ -238,9 +383,16 @@ class Load():
                     "sum(my_value)": 123.3
                 }
         """
+        if not check_sum:
+            check_sum = {}
+            if not self.track_rows_uploaded:
+                raise KeyError("check_sum must be provided for this load as track_rows_uploaded was specified as False.")
+
+        if self.track_rows_uploaded:
+            check_sum["count(*)"] = self.rows_uploaded
+            
         load_commit = comodash_api_client_lowlevel.LoadCommit(check_sum=check_sum)
         return self.load_api_instance.commit_load(self.load_id, load_commit)
-
 
 class Query():
     """
@@ -426,6 +578,616 @@ class Query():
         """ Stop the query"""
         return self.query_api_instance.stop_query(self.query_id)
 
+class DashBulkUploader():
+    """Class to handle multiple loads with utility functions by leveraging the Load class."""
+    def __init__(self, 
+                 auth_token: Auth,
+                 default_chunksize: int = 30000) -> None:
+
+        self.auth_token = auth_token
+        self.uploads = {}
+        self.default_chunksize = default_chunksize
+        self.accepted_file_extensions = [
+            '.csv',
+            '.parquet'            
+        ]
+
+    def refresh_dash_config(self):
+        """Return a new DashConfig object with the auth_token provided to DashBulkUploader."""
+        return DashConfig(self.auth_token)
+    
+    def add_load(
+        self,
+        table_name: str,
+        check_sum: Optional[Dict[str, Union[int, float, str]]] = None, 
+        modify_lambda: Callable = None,
+        load_type: str = 'APPEND_ONLY',
+        load_as_service_client_id: str = None,
+        partitions: Optional[List[str]] = None,
+        track_rows_uploaded: bool = False,
+        path_to_output_for_dryrun: str = None
+    ) -> None:
+        """
+        Creates a new load for a specified lake table. This function initializes the load
+        process, ensuring that the table name is in lowercase and that a checksum or row tracking
+        is provided for data integrity. Created loads can be fetched using the DashBulkUploader().uploads class variable.
+
+        Parameters
+        ----------
+        table_name : str
+            The name of the lake table. Must be in lowercase.
+        check_sum : Optional[Dict[str, Union[int, float, str]]]
+            Checksum data for the files to be committed. The checksum should be a dictionary
+            with Presto/Trino expressions as keys and their expected results as values.
+        modify_lambda : Callable, optional
+            A lambda function to modify the data before loading.
+        load_type : str, default 'APPEND_ONLY'
+            The type of load operation. Default is 'APPEND_ONLY'.
+        load_as_service_client_id : str, optional
+            The service client ID to use for the load. 
+            If service_client is not a field in the source data added to the load, this must be provided or the load will fail on commit.
+        partitions : Optional[List[str]], optional
+            List of partitions for the load to improve query efficieny from the Dash lake.
+        track_rows_uploaded : bool, default False
+            Whether to track the number of rows uploaded for the load.
+        path_to_output_for_dryrun : str, optional
+            If specified, no upload will be made to dash, but files
+            will be saved to the location specified. This is useful for testing.
+
+        Raises
+        ------
+        ValueError
+            If the table name contains uppercase characters or if a load has already been created for the table.
+        KeyError
+            If neither `check_sum` nor `track_rows_uploaded` is provided.
+
+        Returns
+        -------
+        None
+        """
+        if table_name.lower() != table_name:
+            raise ValueError('Only lowercase characters allowed for table_name.')
+        
+        if table_name in self.uploads:
+            raise ValueError(f'A load has been created for the lake table already: {table_name}. Call DashBulkUploader().remove_load({table_name}) if you want to re-start this load.')
+
+        if not check_sum and not track_rows_uploaded:
+            raise KeyError("Invalid arguments: Either provide a check_sum value or set track_rows_uploaded to True.")
+
+        if not load_as_service_client_id:
+            print("WARNING: Dataset will not upload without specifying load_as_service_client_id option unless there is a column in the data source called service_client_id.")
+
+        print(f"Creating new load for lake table: {table_name}")
+        load = Load(
+            config=self.refresh_dash_config(),
+            load_type=load_type,
+            table_name=table_name,
+            load_as_service_client_id=load_as_service_client_id,
+            partitions=partitions,
+            track_rows_uploaded=track_rows_uploaded,
+            path_to_output_for_dryrun=path_to_output_for_dryrun
+        )
+        print(f"Load ID: {load.load_id}")
+        self.uploads[table_name] = {
+            'load': load,
+            'data_sources': {}, 
+            'modify_lambda': modify_lambda,
+            'check_sum': check_sum,
+            'load_status': load.get_load_info().load_status
+        }
+
+    def create_file_key(self, length = 10) -> str:
+        """Used to create a random, valid file key with specified length."""
+    # Ensure length is reasonable
+        if length < 2:
+            raise ValueError("Length must be at least 2")
+
+        # Generate the first character(s): letters or underscore
+        start = random.choice(string.ascii_lowercase + "_")
+        
+        # Generate the middle characters: letters, digits, or underscore
+        middle = ''.join(random.choices(string.ascii_lowercase + string.digits + "_", k=length - 2))
+        
+        # Generate the last character: letters or digits
+        end = random.choice(string.ascii_lowercase + string.digits)
+        
+        return start + middle + end
+    
+    def add_data_to_load(
+        self,
+        table_name: str,
+        data: Union[str, pd.DataFrame],
+        file_key: str = None,
+        chunksize: int = None,
+        source_type: str = None,
+        validate_file_extensions: str = False
+    ) -> None:
+        """
+        Adds data to an existing load for a specified lake table. This function supports adding data
+        from various sources including dataframes, directories, and files, with optional validation
+        of file extensions.
+
+        Parameters
+        ----------
+        table_name : str
+            The name of the lake table to which data will be added.  A load should already be added for this table_name.
+        data : Union[str, pd.DataFrame]
+            The data to be added. Can be a path to a file or directory, or a pandas DataFrame.
+        file_key : str, optional
+            Optional custom key for the file. This will ensure idempotence. Must be lowercase and can include underscores.
+            If not provided, a random file key will be generated using DashBulkUploader.create_file_key().
+            If a directory is provided as the source of data, file_key is ignored and a random file key is generated for each file in the directory.
+            If multiple files are uploaded to the same load with the same file_key, only the last one will be pushed to the lake. 
+        chunksize : int, optional
+            The size of data chunks to be uploaded. If not provided, the default chunksize is used.
+        source_type : str, optional
+            The type of data source. Can be 'df' for DataFrame, 'dir' for directory, or 'file' for file.
+            If not specified, the function will attempt to infer the source type.
+            If a directory is provided, loop through the paths in the directory from listdir() and add valid files as datasources for the lake table.
+        validate_file_extensions : bool, default False
+            Whether to validate file extensions against accepted types.  See the accepted_file_extensions class variable.
+
+        Raises
+        ------
+        ValueError
+            If no existing load is found for the specified table, if the table name is not lowercase,
+            or if the source type cannot be identified.
+        KeyError
+            If neither `check_sum` nor `track_rows_uploaded` is provided.
+
+        Returns
+        -------
+        None
+        """
+        upload = self.uploads.get(table_name)
+        valid_file = True
+
+        if not upload:
+            raise ValueError(f"No existing load for lake table: {table_name}. First run add_load with the table_name specified before adding data to the load.")
+        
+        if not chunksize:
+            chunksize = self.default_chunksize
+
+        if not file_key:
+            file_key = self.create_file_key()
+
+        if not source_type:
+            if isinstance(data, pd.DataFrame):
+                source_type = 'df'
+            elif isdir(data):
+                source_type = 'dir'
+            elif isfile(data):
+                source_type = 'file'
+            else:
+                raise ValueError("Source type could not be identified. Please fix datasource or specify the source_type as ['df', 'dir', 'file']")
+
+        if source_type == 'dir':
+            print(f"Unpacking data sources in directory: {data}")
+
+            data_files = [join(data, file_name) for file_name in listdir(data)]
+            for file in data_files:
+                if not isfile(join(data, file)):
+                    print(f"The following path in the directory provided is not a file and so will not be added as a datasource: {file}")
+                else:
+                    self.add_data_to_load(
+                        table_name=table_name, 
+                        data=file,
+                        file_key=None,  # File keys can't be applied to directories - individual files should be specified if this is required
+                        chunksize=chunksize,
+                        source_type='file',
+                        validate_file_extensions=validate_file_extensions
+                    )
+        else:
+            
+            if source_type == 'file' and validate_file_extensions:
+                file_extension = splitext(data)[1]
+                if file_extension not in self.accepted_file_extensions:
+                    print(f"The file extension {file_extension} is not currently supported and so file was not added: {data}.")
+                    valid_file = False
+            
+            if valid_file:
+                data_source = {
+                    'data': data,
+                    'chunksize': chunksize,
+                    'source_type': source_type
+                }
+
+                upload['data_sources'][file_key] = data_source
+                self.uploads[table_name] = upload
+
+    def remove_data_from_load(
+        self,
+        table_name,
+        file_key
+    ):
+        """
+            Deletes data source with specified file key for table_name from uploads class variable.
+        """
+        print(f"Removing {file_key} from load for {table_name}")
+        self.uploads[table_name]['data_sources'].pop(file_key)
+
+    def remove_load(
+        self,
+        table_name
+    ):
+        """
+            Deletes load for specified table_name from uploads class variable.
+        """
+        print(f"Removing {table_name} from uploads")
+        self.uploads.pop(table_name)
+    
+    def execute_upload(
+        self,
+        table_name: str,
+        max_workers: int = None
+    ) -> None:
+        """
+        Executes the upload process for a specified lake table. This function uses multi-threading
+        to upload data sources concurrently and commits the load upon completion.
+
+        Parameters
+        ----------
+        table_name : str
+            The name of the lake table to which data will be uploaded.
+        max_workers : int
+            The maximum number of threads to use for concurrent uploads (passed to concurrent.futures.ThreadPoolExecutor)
+
+        Raises
+        ------
+        ValueError
+            If no existing load is found for the specified table.
+
+        Returns
+        -------
+        None
+        """
+        pending_load_statuses = ['OPEN']        
+
+        upload = self.uploads[table_name]
+        load_status = upload['load_status']
+
+        if load_status in pending_load_statuses:  # Only perform upload on pending loads
+            load = upload['load']
+            data_sources = upload['data_sources']
+            modify_lambda = upload['modify_lambda']
+            check_sum = upload['check_sum']
+            print(f"Uploading datasources to lake table: {table_name}")
+
+            upload_futures = []
+
+            with ThreadPoolExecutor(max_workers=max_workers) as upload_executor:  # Use multi-threading to speed up uploads
+                for file_key, data_source in data_sources.items():
+                    data = data_source['data']
+                    chunksize = data_source['chunksize']
+                    source_type = data_source['source_type']
+                    
+                    print(f"Uploading data source with file key: {file_key}")
+                    if source_type == 'df':
+                        print("Uploading from DataFrame")
+                        future = upload_executor.submit(self.upload_df, df=data, 
+                                                        load=load, 
+                                                        file_key=file_key, 
+                                                        modify_lambda=modify_lambda)
+                    elif source_type == 'file':
+                        future = upload_executor.submit(self.upload_file, file=data,
+                                                        load=load,
+                                                        file_key=file_key,
+                                                        modify_lambda=modify_lambda,
+                                                        chunksize=chunksize)
+                    
+                    upload_futures.append(future)
+
+                for f in as_completed(upload_futures):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        print(f"Error uploading data source: {e}.")
+                    # End of uploads 
+
+            # Commit load
+            print(f"Uploads completed. Committing load with the following checksums: {check_sum}")
+            load.commit(check_sum=check_sum)
+            updated_load_status = load.get_load_info()
+            self.uploads[table_name]['load_status'] = updated_load_status
+
+    def execute_multiple_uploads(
+        self,
+        table_names: List[str],
+        max_workers: int = None
+    ):
+        """
+            Uses execute_upload function for each table_name in the table_names list provided.
+        """
+        for table_name in table_names:
+            try:
+                self.execute_upload(
+                    table_name = table_name,
+                    max_workers = max_workers
+                )
+            except Exception as e:
+                print(f"Error executing upload to lake table {table_name}: {e}")
+
+    def execute_all_uploads(self):
+        """
+            Uses execute_upload function for all loads created with the DashBulkUploader.
+        """
+        table_names = [table_name for table_name in self.uploads.keys()]
+        self.execute_multiple_uploads(table_names = table_names)
+
+    def get_load_info(self, max_workers: int = None):
+        """
+        Retrieves the load information for all loads created. This function uses multi-threading
+        to concurrently fetch the load status for each table.  This also updates the load_status for each 
+        table_name in the uploads class variable.
+
+        Parameters
+        ----------
+        max_workers : int, default None
+            The maximum number of threads to use for concurrent status retrieval (passed to concurrent.futures.ThreadPoolExecutor)
+
+        Returns
+        -------
+        load_info : dict
+            A dictionary containing the load information for each table, with table names as keys
+            and their respective load statuses as values.
+
+        Raises
+        ------
+        Exception
+            If an error occurs while retrieving the load information for any table, it is caught
+            and printed, but the function continues to retrieve the remaining load statuses.
+        """
+        with ThreadPoolExecutor(max_workers=max_workers) as status_executor:
+            load_info = {table_name: status_executor.submit(upload['load'].get_load_info) for table_name, upload in self.uploads.items()}
+            for table_name, future in zip(load_info.keys(), as_completed(load_info.values())):
+                try:
+                    load_info[table_name] = future.result()
+                    self.uploads[table_name]['load_status'] = future.result()
+                except Exception as e:
+                    print(f"Error getting load {self.uploads[table_name]['load'].load_id}: {e}")
+        
+        return load_info
+     
+    def upload_df(
+        self,
+        df: pd.DataFrame,
+        load: Load,
+        file_key: str = None,
+        modify_lambda: Callable = None
+    ):
+        """
+        Uploads a pandas DataFrame to the specified load. This function optionally modifies the DataFrame
+        using a provided lambda function, generates a file key if not provided, and uploads the data.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            The DataFrame to be uploaded.
+        load : Load
+            The load object to which the DataFrame will be uploaded.
+        file_key : str, optional
+            A unique key for the file being uploaded. If not provided, a key will be generated.
+        modify_lambda : Callable, optional
+            A lambda function to modify the DataFrame before uploading.
+
+        Returns
+        -------
+        Any
+            The response from the load upload API call.
+
+        Raises
+        ------
+        ValueError
+            If the DataFrame is empty or if the upload fails.
+        """
+        if modify_lambda:
+            modify_lambda(df)
+
+        if not file_key:
+            file_key = self.create_file_key()
+
+        df.columns = [re.sub(r'\s+', '_', column.lower()) for column in df.columns]
+
+        response = load.upload(
+            data=df,
+            file_key=file_key
+        )
+
+        return response
+
+    def upload_file(
+        self,
+        file: Union[str, io.BytesIO],
+        load: Load,
+        file_key: str = None,
+        modify_lambda: Callable = None,
+        chunksize: int = None,
+        max_workers: int = None,
+        **pd_read_kwargs
+    ):
+        """
+        Uploads a file to the specified load, reading the file in chunks and optionally modifying
+        each chunk using a provided lambda function. This function supports both CSV and Parquet files.
+
+        Parameters
+        ----------
+        file : Union[str, io.BytesIO]
+            The file to be uploaded. Can be a file path or a BytesIO object.
+        load : Load
+            The load object to which the file will be uploaded.
+        file_key : str, optional
+            A unique key for the file being uploaded. If not provided, a key will be generated.
+        modify_lambda : Callable, optional
+            A lambda function to modify each chunk of the file before uploading.
+        chunksize : int, optional
+            The size of data chunks to be uploaded. If not provided, the default chunksize is used.
+        max_workers : int, default 5
+            The maximum number of threads to use for concurrent uploads (passed to concurrent.futures.ThreadPoolExecutor)
+        **pd_read_kwargs
+            Additional keyword arguments to pass to the pandas read function (e.g., `pd.read_csv` or `pd.read_parquet`).
+            Note that filepath_or_buffer, chunksize and dtype are passed by default and so duplicating those here could cause issues.
+
+        Returns
+        -------
+        List[Any]
+            A list of responses from the load upload API call for each chunk.
+
+        Raises
+        ------
+        ValueError
+            If the file type cannot be determined or if an error occurs during the upload of any chunk.
+        """
+        responses = []
+        if not chunksize:
+            chunksize = self.default_chunksize
+
+        if not file_key:
+            file_key = self.create_file_key()
+        
+        print(f"Uploading csv file: {file}")
+
+        # Reading CSV in chunks, converting each to Parquet, and uploading
+        try_functions = [pd.read_csv, pd.read_parquet]
+
+        for func in try_functions:
+            try:
+                func(file, nrows=1, **pd_read_kwargs)
+                func_to_use = func
+                break
+            except:
+                pass
+        
+        if not func_to_use:
+            raise ValueError(f"Could not determine file type for datasource with the following file key: {file_key}")
+        
+        try:
+            i = 1
+            chunk_futures = []
+            with ThreadPoolExecutor(max_workers=max_workers) as chunk_ex:  # Using threads for concurrent chunk uploads
+
+                for chunk in func_to_use(file, chunksize=chunksize, dtype=object, **pd_read_kwargs):
+                    file_key_to_use = file_key + f"_{i}"
+                    future = chunk_ex.submit(self.upload_df,
+                                            df=chunk,
+                                            load=load,
+                                            file_key=file_key_to_use,
+                                            modify_lambda=modify_lambda)
+                    chunk_futures.append(future)
+                    i += 1
+                
+                for future in as_completed(chunk_futures):
+                    responses.append(future.result())
+
+        except Exception as e:
+            raise ValueError(f"Error when uploading chunk: {e}")
+            
+        print("All chunks uploaded successfully")
+
+        return responses
+    
+    def v1_upload_csv(
+            self,
+            file: Union[str, io.FileIO],
+            dash_table: str,
+            dash_orgname: str,
+            dash_api_key: str,
+            encoding: str = 'utf-8',
+            chunksize: int = 30000,
+            modify_lambda: Callable = None,
+            path_to_output_for_dryrun: str = None,
+            service_client_id: str = '0'
+        ):
+            """Reads a file and uploads to dash.
+
+            This function will:
+            - Read a csv file
+            - Break it up into multiple csv's
+            - each with a maximum number of lines defined by chunksize
+            - upload them to dash
+
+            Parameters
+            ----------
+            file : Union[str, io.FileIO]
+                Either a path to the file to be uploaded,
+                or a FileIO stream representing the file to be uploaded
+                Should be an unencrypted, uncompressed CSV file
+            dash_table: str
+                name of Dash table to upload the file to
+            dash_orgname: str
+                orgname of your Dash instance
+            dash_api_key: str
+                valid api key for Dash API
+            encoding: str
+                the encoding of the source file.  defaults to utf-8.
+            chunksize: int
+                (optional)
+                the maximum number of lines to be included in each file.
+                Note that this should be low enough that the zipped file is less
+                than Dash maximum gzipped file size. Defaults to 30000.
+            modify_lambda:
+                (optional)
+                a callable that recieves the pandas dataframe read from the
+                csv.  Gives the opportunity to modify - such as adding a timestamp
+                column.
+                Is not required.
+            path_to_output_for_dryrun: str
+                (optional)
+                if specified, no upload will be made to dash, but files
+                will be saved to the location specified. This is useful for
+                testing.
+                multiple files will be created: [table_name].[i].csv.gz where i
+                represents multiple file parts
+            service_client_id: str
+                (optional)
+                if specified, specifies the service client for the upload. See the dash documentation for an explanation of service client.
+                https://docs.comotion.us/Comotion%20Dash/Analysts/How%20To/Prepare%20Your%20Data%20Model/Y%20Service%20Client%20and%20Row%20Level%20Security.html#service-client-and-row-level-security
+            Returns
+            -------
+            List
+                List of http responses
+            """
+            file_reader = pd.read_csv(
+                file,
+                chunksize=chunksize,
+                encoding=encoding,
+                dtype=str  # Set all columns to strings.  Dash will still infer the type, but this makes sure it doesnt mess with the contents of the csv before upload
+            )
+
+            i = 1
+            responses = []
+            for file_df in file_reader:
+
+                if modify_lambda is not None:
+                    modify_lambda(file_df)
+
+
+                csv_stream = create_gzipped_csv_stream_from_df(file_df)
+
+                if path_to_output_for_dryrun is None:
+
+                    response = upload_csv_to_dash(
+                        dash_orgname=dash_orgname,
+                        dash_api_key=dash_api_key,
+                        dash_table=dash_table,
+                        csv_gz_stream=csv_stream,
+                        service_client_id=service_client_id
+                    )
+
+                    responses.append(response.text)
+
+                else:
+                    with open(
+                        join(
+                            path_to_output_for_dryrun,
+                            dash_table + "." + str(i) + ".csv.gz"
+                        ),
+                        "wb"
+                    ) as f:
+                        f.write(csv_stream.getvalue())
+
+                i = i + 1
+
+            self.upload_responses[dash_table] = responses
 
 def upload_csv_to_dash(
     dash_orgname: str, # noqa
@@ -506,109 +1268,160 @@ def create_gzipped_csv_stream_from_df(df: pd.DataFrame) -> io.BytesIO:
 
     return csv_stream
 
-
 def read_and_upload_file_to_dash(
     file: Union[str, io.FileIO],
     dash_table: str,
     dash_orgname: str,
-    dash_api_key: str,
+    file_key: str = None,
+    dash_api_key: str = None,
+    check_sum: Optional[Dict[str, Union[int, float, str]]] = None,
     encoding: str = 'utf-8',
     chunksize: int = 30000,
     modify_lambda: Callable = None,
     path_to_output_for_dryrun: str = None,
-    service_client_id: str = '0'
-):
-    """Reads a file and uploads to dash.
+    service_client_id: str = '0',
+    partitions: Optional[List[str]] = None,
+    load_type: str = 'APPEND_ONLY',
+    data_model_version: str = None,
+    entity_type: str = Auth.USER,
+    application_client_id: str = None,
+    application_client_secret: str = None
+) -> Union[List[Any], DashBulkUploader]:
+    """
+    Reads a file and uploads it to Dash.
 
     This function will:
-    - Read a csv file
-    - Break it up into multiple csv's
-    - each with a maximum number of lines defined by chunksize
-    - upload them to dash
+    - Read a CSV file
+    - Break it up into multiple CSVs, each with a maximum number of lines defined by `chunksize`
+    - Upload them to Dash
 
     Parameters
     ----------
     file : Union[str, io.FileIO]
-        Either a path to the file to be uploaded,
-        or a FileIO stream representing the file to be uploaded
-        Should be an unencrypted, uncompressed CSV file
-    dash_table: str
-        name of Dash table to upload the file to
-    dash_orgname: str
-        orgname of your Dash instance
-    dash_api_key: str
-        valid api key for Dash API
-    encoding: str
-        the encoding of the source file.  defaults to utf-8.
-    chunksize: int
-        (optional)
-        the maximum number of lines to be included in each file.
-        Note that this should be low enough that the zipped file is less
-        than Dash maximum gzipped file size. Defaults to 30000.
-    modify_lambda:
-        (optional)
-        a callable that recieves the pandas dataframe read from the
-        csv.  Gives the opportunity to modify - such as adding a timestamp
-        column.
-        Is not required.
-    path_to_output_for_dryrun: str
-        (optional)
-        if specified, no upload will be made to dash, but files
-        will be saved to the location specified. This is useful for
-        testing.
-        multiple files will be created: [table_name].[i].csv.gz where i
-        represents multiple file parts
-    service_client_id: str
-        (optional)
-        if specified, specifies the service client for the upload. See the dash documentation for an explanation of service client.
+        Either a path to the file to be uploaded, or a FileIO stream representing the file to be uploaded.
+        Should be an unencrypted, uncompressed CSV file.
+    dash_table : str
+        Name of the Dash table to upload the file to.
+    dash_orgname : str
+        Orgname of your Dash instance.
+    file_key : str, optional
+        A unique key for the file being uploaded. If not provided, a key will be generated.
+    dash_api_key : str, optional
+        Valid API key for Dash API. Required for v1 data model uploads.
+    check_sum : Optional[Dict[str, Union[int, float, str]]], optional
+        Checksum data for the files to be committed. The checksum should be a dictionary
+        with Presto/Trino expressions as keys and their expected results as values.
+    encoding : str, default 'utf-8'
+        The encoding of the source file.
+    chunksize : int, default 30000
+        The maximum number of lines to be included in each file. Note that this should be low enough
+        that the zipped file is less than Dash's maximum gzipped file size.
+    modify_lambda : Callable, optional
+        A callable that receives the pandas DataFrame read from the CSV. Provides the opportunity to modify
+        the DataFrame, such as adding a timestamp column.
+    path_to_output_for_dryrun : str, optional
+        If specified, no upload will be made to Dash, but files will be saved to the location specified.
+        This is useful for testing. Multiple files will be created (1 per chunk)
+    service_client_id : str, optional
+        If specified, specifies the service client for the upload. See the Dash documentation for an explanation
+        of the service client.
+        https://docs.comotion.us/Comotion%20Dash/Analysts/How%20To/Prepare%20Your%20Data%20Model/Y%20Service%20Client%20and%20Row%20Level%20Security.html#service-client-and-row-level-security
+    partitions : Optional[List[str]], optional
+        List of partitions for the load.
+    load_type : str, default 'APPEND_ONLY'
+        The type of load operation. Default is 'APPEND_ONLY'.
+    data_model_version : str, optional
+        The data model version to use for the upload. If not specified, the function will determine the version.
+        If the migration status for the org is 'Completed', v2 is the model version.  Otherwise, v1 is the model version.
+        data_model_version only needs be specified in exceptional circumstances where there are issues determining the migration status.
+    entity_type : str, default Auth.USER
+        The entity type for authentication.
+    application_client_id : str, optional
+        The application client ID for authentication.
+    application_client_secret : str, optional
+        The application client secret for authentication.
 
     Returns
     -------
-    List
-        List of http responses
+    Union[List[Any], DashBulkUploader]
+        For v1 data model uploads, returns a list of HTTP responses.
+        For v2 data model uploads, returns the DashBulkUploader instance.
+
+    Raises
+    ------
+    ValueError
+        If the API key is not specified for v1 lake upload or if the file type cannot be determined.
     """
-    file_reader = pd.read_csv(
-        file,
-        chunksize=chunksize,
-        encoding=encoding,
-        dtype=str  # Set all columns to strings.  Dash will still infer the type, but this makes sure it doesnt mess with the contents of the csv before upload
-    )
+    auth_token = Auth(orgname=dash_orgname,
+                      entity_type=entity_type,
+                      application_client_id=application_client_id,
+                      application_client_secret=application_client_secret)
+    
+    uploader = DashBulkUploader(auth_token=auth_token)
+    if not data_model_version or data_model_version not in ['v1', 'v2']:
+        print("Determining Data Model Version")
+        try:
+            config = uploader.refresh_dash_config()
 
-    i = 1
-    responses = []
-    for file_df in file_reader:
+            # Get migration status
+            migration = Migration(config)
+            print('Migration Status: ' + str(migration.status().full_migration_status))
+            if migration.status().full_migration_status == 'Completed':
+                data_model_version = 'v2'
+            else:
+                data_model_version = 'v1'
+        except Exception as e: 
+            print(f'Error determining data model version: {e}')
+            data_model_version = 'v1'
+    else:
+        config = uploader.refresh_dash_config()
 
-        if modify_lambda is not None:
-            modify_lambda(file_df)
+    print(f"Uploading to data model {data_model_version}")
 
+    if data_model_version == 'v1':
+        if dash_api_key is None:
+            raise ValueError("API Key needs to be specified for v1 lake upload.")
 
-        csv_stream = create_gzipped_csv_stream_from_df(file_df)
+        responses = uploader.v1_upload_csv(
+            file=file,
+            dash_table=dash_table,
+            dash_orgname=dash_orgname,
+            dash_api_key=dash_api_key,
+            encoding=encoding,
+            chunksize=chunksize,
+            modify_lambda=modify_lambda,
+            path_to_output_for_dryrun=path_to_output_for_dryrun,
+            service_client_id=service_client_id
+        )
+        return responses
+    
+    elif data_model_version == 'v2':
+        track_rows_uploaded = not check_sum
+            
+        uploader.add_load(
+            table_name=dash_table,
+            check_sum=check_sum, 
+            modify_lambda=modify_lambda,
+            load_type=load_type,
+            load_as_service_client_id=service_client_id,
+            partitions=partitions,
+            track_rows_uploaded=track_rows_uploaded,
+            path_to_output_for_dryrun=path_to_output_for_dryrun
+        )
+        
+        uploader.add_data_to_load(
+            table_name=dash_table,
+            data=file,
+            file_key=file_key,
+            chunksize=chunksize
+        )
 
-        if path_to_output_for_dryrun is None:
+        uploader.execute_upload(table_name=dash_table)  # Only need 1 worker as there is only 1 file.
+        
+        print("Upload completed and commit initiated")
 
-            response = upload_csv_to_dash(
-                dash_orgname=dash_orgname,
-                dash_api_key=dash_api_key,
-                dash_table=dash_table,
-                csv_gz_stream=csv_stream,
-                service_client_id=service_client_id
-            )
+        return uploader
 
-            responses.append(response.text)
-
-        else:
-            with open(
-                join(
-                    path_to_output_for_dryrun,
-                    dash_table + "." + str(i) + ".csv.gz"
-                ),
-                "wb"
-            ) as f:
-                f.write(csv_stream.getvalue())
-
-        i = i + 1
-
-    return responses
 
 class Migration():
     """
